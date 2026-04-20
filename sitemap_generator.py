@@ -84,7 +84,7 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)'
             )
             page = context.new_page()
 
@@ -115,8 +115,23 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                 try:
                     resp = page.goto(url, timeout=15000, wait_until='domcontentloaded')
 
-                    if not resp or resp.status != 200:
-                        pipe_conn.send(('LOG', f'  スキップ ({resp.status if resp else "no resp"}): {url}'))
+                    if not resp:
+                        pipe_conn.send(('LOG', f'  スキップ (no resp): {url}'))
+                        continue
+
+                    # 429 Too Many Requests: バックオフして再試行
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get('retry-after', '30'))
+                        wait = max(retry_after, 30)
+                        pipe_conn.send(('LOG', f'  ⏳ 429 レート制限: {wait}秒待機後に再試行 {url}'))
+                        time.sleep(wait)
+                        resp = page.goto(url, timeout=15000, wait_until='domcontentloaded')
+                        if not resp or resp.status != 200:
+                            pipe_conn.send(('LOG', f'  スキップ (再試行失敗 {resp.status if resp else "no resp"}): {url}'))
+                            continue
+
+                    if resp.status != 200:
+                        pipe_conn.send(('LOG', f'  スキップ ({resp.status}): {url}'))
                         continue
 
                     # リダイレクト検出
