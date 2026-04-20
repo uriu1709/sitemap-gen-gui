@@ -7,6 +7,12 @@ XML サイトマップ生成ツール（Playwright版）
 - priority / changefreq / lastmod 設定
 - 除外URLパターン設定
 - 50,000件超の分割サイトマップ対応
+- robots.txt Disallow/Crawl-delay 準拠
+- X-Robots-Tag / meta noindex・nofollow 対応
+- canonical URL 収集
+- SSRF対策（プライベートIPブロック）
+- 429/500/503 バックオフリトライ
+- エラー率監視・自動中断
 """
 
 import tkinter as tk
@@ -22,6 +28,8 @@ import os
 import sys
 import queue
 import time
+import socket
+import ipaddress
 
 
 def _get_browsers_path():
@@ -29,6 +37,37 @@ def _get_browsers_path():
     if getattr(sys, 'frozen', False):
         return os.path.join(os.path.dirname(sys.executable), 'browsers')
     return None
+
+
+def _is_private_host(hostname):
+    """ホスト名がプライベート/ループバック/リンクローカルIPに解決される場合True"""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+        for info in infos:
+            ip_str = info[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast
+                    or ip.is_unspecified):
+                return True
+        return False
+    except Exception:
+        return True  # DNS解決失敗はブロック扱い
+
+
+def _is_safe_url(url):
+    """スキームがhttp/httpsで、プライベートIPでないことを確認"""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ('http', 'https'):
+            return False
+        if not p.hostname:
+            return False
+        if _is_private_host(p.hostname):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -47,10 +86,21 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         pipe_conn.close()
         return
 
+    # 起点URLの安全チェック
+    if not _is_safe_url(base_url):
+        pipe_conn.send(('ERROR', f'安全でないURLです（プライベートIPまたは不正スキーム）: {base_url}'))
+        pipe_conn.close()
+        return
+
     domain = urlparse(base_url).netloc
     url_data = {}
     to_visit = [base_url.rstrip('/')]
     visited = set()
+
+    # エラー率監視用
+    recent_results = []   # True=成功, False=失敗
+    ERROR_RATE_WINDOW = 20
+    ERROR_RATE_THRESHOLD = 0.7
 
     def is_excluded(url):
         for pat in exclude_patterns:
@@ -64,9 +114,20 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                 pass
         return False
 
+    def record_result(success):
+        recent_results.append(success)
+        if len(recent_results) > ERROR_RATE_WINDOW:
+            recent_results.pop(0)
+
+    def high_error_rate():
+        if len(recent_results) < ERROR_RATE_WINDOW:
+            return False
+        fail_rate = recent_results.count(False) / len(recent_results)
+        return fail_rate >= ERROR_RATE_THRESHOLD
+
     # robots.txt を取得して Disallow / Crawl-delay を確認
     from urllib.robotparser import RobotFileParser
-    crawl_delay = delay  # デフォルトはGUI設定値
+    crawl_delay = delay
     rp = RobotFileParser()
     try:
         parsed_base = urlparse(base_url)
@@ -78,23 +139,37 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
             crawl_delay = max(delay, float(robots_delay))
             pipe_conn.send(('LOG', f'  robots.txt Crawl-delay: {robots_delay}s → {crawl_delay}s で動作'))
     except Exception:
-        rp = None  # 取得失敗時はチェックなし
+        rp = None
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent='SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)'
+                user_agent='SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)',
+                service_workers='block',
             )
             page = context.new_page()
 
-            # HTMLとリンク抽出に必要なリソースのみ許可（余計なAPIリクエストをブロック）
-            BLOCK_TYPES = {'image', 'media', 'font', 'stylesheet', 'fetch', 'xhr', 'websocket', 'eventsource', 'other'}
+            # ダイアログ（alert/confirm/prompt）を自動で閉じる
+            page.on('dialog', lambda dialog: dialog.dismiss())
+
+            # HTMLとscriptのみ許可（余計なAPIリクエストをブロック）
+            BLOCK_TYPES = {'image', 'media', 'font', 'stylesheet', 'fetch', 'xhr',
+                           'websocket', 'eventsource', 'other'}
+
             def handle_route(route):
+                try:
+                    p = urlparse(route.request.url)
+                    if p.scheme not in ('http', 'https'):
+                        route.abort()
+                        return
+                except Exception:
+                    pass
                 if route.request.resource_type in BLOCK_TYPES:
                     route.abort()
                 else:
                     route.continue_()
+
             page.route('**/*', handle_route)
 
             while to_visit and len(url_data) < max_pages:
@@ -102,9 +177,22 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     pipe_conn.send(('LOG', '⏹ クロールを中断しました。'))
                     break
 
+                if high_error_rate():
+                    pipe_conn.send(('LOG',
+                        f'\n⚠️ エラー率が高すぎます（直近{ERROR_RATE_WINDOW}件中'
+                        f'{recent_results.count(False)}件失敗）。クロールを中断します。'))
+                    break
+
                 url = to_visit.pop(0)
                 if url in visited or is_excluded(url):
                     continue
+
+                # SSRF対策: ループ内でもURLの安全チェック
+                if not _is_safe_url(url):
+                    pipe_conn.send(('LOG', f'  ブロック (プライベートIP/不正スキーム): {url}'))
+                    visited.add(url)
+                    continue
+
                 # robots.txt の Disallow チェック
                 if rp and not rp.can_fetch('*', url):
                     pipe_conn.send(('LOG', f'  robots.txt 除外: {url}'))
@@ -113,32 +201,89 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                 visited.add(url)
 
                 try:
-                    resp = page.goto(url, timeout=15000, wait_until='domcontentloaded')
+                    resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
 
                     if not resp:
                         pipe_conn.send(('LOG', f'  スキップ (no resp): {url}'))
+                        record_result(False)
                         continue
 
-                    # 429 Too Many Requests: バックオフして再試行
+                    # X-Robots-Tag ヘッダーチェック
+                    x_robots = resp.headers.get('x-robots-tag', '').lower()
+                    xr_noindex = 'noindex' in x_robots
+                    xr_nofollow = 'nofollow' in x_robots
+
+                    # 429: バックオフして1回再試行
                     if resp.status == 429:
                         retry_after = int(resp.headers.get('retry-after', '30'))
                         wait = max(retry_after, 30)
                         pipe_conn.send(('LOG', f'  ⏳ 429 レート制限: {wait}秒待機後に再試行 {url}'))
                         time.sleep(wait)
-                        resp = page.goto(url, timeout=15000, wait_until='domcontentloaded')
+                        resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
                         if not resp or resp.status != 200:
                             pipe_conn.send(('LOG', f'  スキップ (再試行失敗 {resp.status if resp else "no resp"}): {url}'))
+                            record_result(False)
                             continue
 
-                    if resp.status != 200:
-                        pipe_conn.send(('LOG', f'  スキップ ({resp.status}): {url}'))
+                    # 500/503: 指数バックオフで最大3回リトライ
+                    if resp and resp.status in (500, 503):
+                        succeeded = False
+                        for attempt in range(1, 4):
+                            wait = min(2 ** attempt, 60)
+                            pipe_conn.send(('LOG', f'  ⏳ {resp.status} サーバーエラー: {wait}秒後にリトライ ({attempt}/3) {url}'))
+                            time.sleep(wait)
+                            resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                            if resp and resp.status == 200:
+                                succeeded = True
+                                break
+                        if not succeeded:
+                            pipe_conn.send(('LOG', f'  スキップ (リトライ失敗): {url}'))
+                            record_result(False)
+                            continue
+
+                    if not resp or resp.status != 200:
+                        pipe_conn.send(('LOG', f'  スキップ ({resp.status if resp else "no resp"}): {url}'))
+                        record_result(False)
                         continue
 
                     # リダイレクト検出
                     final_url = page.url.rstrip('/')
                     if final_url != url.rstrip('/'):
                         pipe_conn.send(('LOG', f'  リダイレクト除外: {url} → {page.url}'))
+                        record_result(True)
+                        if crawl_delay > 0:
+                            time.sleep(crawl_delay)
                         continue
+
+                    # meta robots チェック
+                    meta_noindex = False
+                    meta_nofollow = False
+                    try:
+                        content = page.get_attribute('meta[name="robots"]', 'content') or ''
+                        content = content.lower()
+                        meta_noindex = 'noindex' in content
+                        meta_nofollow = 'nofollow' in content
+                    except Exception:
+                        pass
+
+                    add_to_sitemap = not (xr_noindex or meta_noindex)
+                    follow_links = not (xr_nofollow or meta_nofollow)
+
+                    if xr_noindex or meta_noindex:
+                        pipe_conn.send(('LOG', f'  noindex 除外 (サイトマップ非登録): {url}'))
+
+                    # canonical URL チェック
+                    sitemap_url = url
+                    try:
+                        canonical = page.get_attribute('link[rel="canonical"]', 'href') or ''
+                        canonical = canonical.strip().split('#')[0].split('?')[0].rstrip('/')
+                        if canonical and canonical != url:
+                            p_can = urlparse(canonical)
+                            if p_can.netloc == domain and p_can.scheme in ('http', 'https'):
+                                pipe_conn.send(('LOG', f'  canonical: {url} → {canonical}'))
+                                sitemap_url = canonical
+                    except Exception:
+                        pass
 
                     # lastmod 取得
                     lastmod = None
@@ -156,32 +301,37 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     if not lastmod:
                         lastmod = datetime.now().strftime('%Y-%m-%d')
 
-                    url_data[url] = lastmod
-                    pipe_conn.send(('LOG', f'[{len(url_data):>5}] {url}'))
+                    if add_to_sitemap and sitemap_url not in url_data:
+                        url_data[sitemap_url] = lastmod
+                        pipe_conn.send(('LOG', f'[{len(url_data):>5}] {sitemap_url}'))
 
-                    # JS描画後のDOMからリンク抽出
-                    try:
-                        anchors = page.eval_on_selector_all(
-                            'a[href]', 'els => els.map(e => e.href)'
-                        )
-                        for abs_url in anchors:
-                            abs_url = abs_url.split('#')[0].split('?')[0].rstrip('/')
-                            if not abs_url:
-                                continue
-                            p = urlparse(abs_url)
-                            if (p.netloc == domain
-                                    and abs_url not in visited
-                                    and abs_url not in to_visit
-                                    and p.scheme in ('http', 'https')):
-                                to_visit.append(abs_url)
-                    except Exception:
-                        pass
+                    # リンク抽出（nofollow でなければ）
+                    if follow_links:
+                        try:
+                            anchors = page.eval_on_selector_all(
+                                'a[href]', 'els => els.map(e => e.href)'
+                            )
+                            for abs_url in anchors:
+                                abs_url = abs_url.split('#')[0].split('?')[0].rstrip('/')
+                                if not abs_url:
+                                    continue
+                                p = urlparse(abs_url)
+                                if (p.netloc == domain
+                                        and abs_url not in visited
+                                        and abs_url not in to_visit
+                                        and p.scheme in ('http', 'https')):
+                                    to_visit.append(abs_url)
+                        except Exception:
+                            pass
+
+                    record_result(True)
 
                     if crawl_delay > 0:
                         time.sleep(crawl_delay)
 
                 except Exception as e:
                     pipe_conn.send(('LOG', f'  エラー: {url} → {e}'))
+                    record_result(False)
 
             browser.close()
 
