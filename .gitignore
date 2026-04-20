@@ -1,0 +1,17 @@
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 環境
+.env
+.venv/
+venv/
+
+# Serena（ツール設定）
+.serena/

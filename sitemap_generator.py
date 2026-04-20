@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+XML サイトマップ生成ツール（Playwright版）
+- JS描画後のDOMからリンク抽出（ヘッダー・フッター対応）
+- リダイレクト検出・除外
+- priority / changefreq / lastmod 設定
+- 除外URLパターン設定
+- 50,000件超の分割サイトマップ対応
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import multiprocessing
+import threading
+from urllib.parse import urlparse
+from datetime import datetime
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+import re
+import os
+import sys
+import queue
+import time
+
+
+def _get_browsers_path():
+    """PyInstaller exe実行時はexeと同階層の 'browsers' フォルダを参照"""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), 'browsers')
+    return None
+
+
+# ─────────────────────────────────────────────
+# クローラー（別プロセスで実行）
+# ─────────────────────────────────────────────
+def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, stop_flag):
+    # PyInstaller exe時はブラウザパスを設定
+    browsers_path = _get_browsers_path()
+    if browsers_path:
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = browsers_path
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pipe_conn.send(('ERROR', 'Playwrightがインストールされていません。\npip install playwright\nplaywright install chromium'))
+        pipe_conn.close()
+        return
+
+    domain = urlparse(base_url).netloc
+    url_data = {}
+    to_visit = [base_url.rstrip('/')]
+    visited = set()
+
+    def is_excluded(url):
+        for pat in exclude_patterns:
+            pat = pat.strip()
+            if not pat:
+                continue
+            try:
+                if re.search(pat, url):
+                    return True
+            except re.error:
+                pass
+        return False
+
+    # robots.txt を取得して Disallow / Crawl-delay を確認
+    from urllib.robotparser import RobotFileParser
+    crawl_delay = delay  # デフォルトはGUI設定値
+    rp = RobotFileParser()
+    try:
+        parsed_base = urlparse(base_url)
+        robots_url = f'{parsed_base.scheme}://{parsed_base.netloc}/robots.txt'
+        rp.set_url(robots_url)
+        rp.read()
+        robots_delay = rp.crawl_delay('*')
+        if robots_delay:
+            crawl_delay = max(delay, float(robots_delay))
+            pipe_conn.send(('LOG', f'  robots.txt Crawl-delay: {robots_delay}s → {crawl_delay}s で動作'))
+    except Exception:
+        rp = None  # 取得失敗時はチェックなし
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = context.new_page()
+
+            # HTMLとリンク抽出に必要なリソースのみ許可（余計なAPIリクエストをブロック）
+            BLOCK_TYPES = {'image', 'media', 'font', 'stylesheet', 'fetch', 'xhr', 'websocket', 'eventsource', 'other'}
+            def handle_route(route):
+                if route.request.resource_type in BLOCK_TYPES:
+                    route.abort()
+                else:
+                    route.continue_()
+            page.route('**/*', handle_route)
+
+            while to_visit and len(url_data) < max_pages:
+                if stop_flag.value:
+                    pipe_conn.send(('LOG', '⏹ クロールを中断しました。'))
+                    break
+
+                url = to_visit.pop(0)
+                if url in visited or is_excluded(url):
+                    continue
+                # robots.txt の Disallow チェック
+                if rp and not rp.can_fetch('*', url):
+                    pipe_conn.send(('LOG', f'  robots.txt 除外: {url}'))
+                    visited.add(url)
+                    continue
+                visited.add(url)
+
+                try:
+                    resp = page.goto(url, timeout=15000, wait_until='domcontentloaded')
+
+                    if not resp or resp.status != 200:
+                        pipe_conn.send(('LOG', f'  スキップ ({resp.status if resp else "no resp"}): {url}'))
+                        continue
+
+                    # リダイレクト検出
+                    final_url = page.url.rstrip('/')
+                    if final_url != url.rstrip('/'):
+                        pipe_conn.send(('LOG', f'  リダイレクト除外: {url} → {page.url}'))
+                        continue
+
+                    # lastmod 取得
+                    lastmod = None
+                    try:
+                        lm_header = resp.headers.get('last-modified', '')
+                        if lm_header:
+                            for fmt in ['%a, %d %b %Y %H:%M:%S %Z', '%a, %d %b %Y %H:%M:%S GMT']:
+                                try:
+                                    lastmod = datetime.strptime(lm_header, fmt).strftime('%Y-%m-%d')
+                                    break
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    if not lastmod:
+                        lastmod = datetime.now().strftime('%Y-%m-%d')
+
+                    url_data[url] = lastmod
+                    pipe_conn.send(('LOG', f'[{len(url_data):>5}] {url}'))
+
+                    # JS描画後のDOMからリンク抽出
+                    try:
+                        anchors = page.eval_on_selector_all(
+                            'a[href]', 'els => els.map(e => e.href)'
+                        )
+                        for abs_url in anchors:
+                            abs_url = abs_url.split('#')[0].split('?')[0].rstrip('/')
+                            if not abs_url:
+                                continue
+                            p = urlparse(abs_url)
+                            if (p.netloc == domain
+                                    and abs_url not in visited
+                                    and abs_url not in to_visit
+                                    and p.scheme in ('http', 'https')):
+                                to_visit.append(abs_url)
+                    except Exception:
+                        pass
+
+                    if crawl_delay > 0:
+                        time.sleep(crawl_delay)
+
+                except Exception as e:
+                    pipe_conn.send(('LOG', f'  エラー: {url} → {e}'))
+
+            browser.close()
+
+    except Exception as e:
+        pipe_conn.send(('ERROR', f'クローラー起動エラー: {e}'))
+        pipe_conn.close()
+        return
+
+    pipe_conn.send(('LOG', f'\n✅ クロール完了: {len(url_data)} URL 収集'))
+    pipe_conn.send(('DONE', url_data))
+    pipe_conn.close()
+
+
+# ─────────────────────────────────────────────
+# サイトマップ書き出し
+# ─────────────────────────────────────────────
+def build_sitemap_xml(urls_data, priority, changefreq):
+    root = ET.Element('urlset')
+    root.set('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9')
+    for url, lastmod in urls_data:
+        url_el = ET.SubElement(root, 'url')
+        ET.SubElement(url_el, 'loc').text = url
+        if lastmod:
+            ET.SubElement(url_el, 'lastmod').text = lastmod
+        ET.SubElement(url_el, 'changefreq').text = changefreq
+        ET.SubElement(url_el, 'priority').text = str(priority)
+    xml_str = minidom.parseString(ET.tostring(root, encoding='unicode')).toprettyxml(indent='  ')
+    return '\n'.join(l for l in xml_str.splitlines() if l.strip())
+
+
+def build_sitemap_index(sitemap_urls):
+    root = ET.Element('sitemapindex')
+    root.set('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9')
+    for su in sitemap_urls:
+        sm = ET.SubElement(root, 'sitemap')
+        ET.SubElement(sm, 'loc').text = su
+        ET.SubElement(sm, 'lastmod').text = datetime.now().strftime('%Y-%m-%d')
+    xml_str = minidom.parseString(ET.tostring(root, encoding='unicode')).toprettyxml(indent='  ')
+    return '\n'.join(l for l in xml_str.splitlines() if l.strip())
+
+
+def save_sitemaps(url_data, out_dir, base_url_for_index, priority, changefreq, chunk_size=50000):
+    items = list(url_data.items())
+    saved_files = []
+    if len(items) <= chunk_size:
+        xml = build_sitemap_xml(items, priority, changefreq)
+        path = os.path.join(out_dir, 'sitemap.xml')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(xml)
+        saved_files.append(path)
+    else:
+        chunks = [items[i:i+chunk_size] for i in range(0, len(items), chunk_size)]
+        sitemap_urls = []
+        for idx, chunk in enumerate(chunks, 1):
+            fname = f'sitemap{idx}.xml'
+            xml = build_sitemap_xml(chunk, priority, changefreq)
+            path = os.path.join(out_dir, fname)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(xml)
+            saved_files.append(path)
+            sitemap_urls.append(f"{base_url_for_index.rstrip('/')}/{fname}")
+        idx_xml = build_sitemap_index(sitemap_urls)
+        idx_path = os.path.join(out_dir, 'sitemap_index.xml')
+        with open(idx_path, 'w', encoding='utf-8') as f:
+            f.write(idx_xml)
+        saved_files.insert(0, idx_path)
+    return saved_files
+
+
+# ─────────────────────────────────────────────
+# GUIアプリ
+# ─────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("XML サイトマップ生成ツール")
+        self.geometry("820x700")
+        self.resizable(True, True)
+        self.configure(bg='#f5f5f5')
+
+        self.crawl_process = None
+        self.stop_flag = None
+        self.log_queue = queue.Queue()
+        self.url_data = {}
+
+        self._build_ui()
+        self._poll_log()
+
+    def _build_ui(self):
+        style = ttk.Style(self)
+        style.theme_use('clam')
+        style.configure('TLabelframe.Label', font=('Meiryo', 10, 'bold'))
+        style.configure('Accent.TButton', font=('Meiryo', 10, 'bold'))
+        pad = {'padx': 10, 'pady': 5}
+
+        frm_crawl = ttk.LabelFrame(self, text='🌐 クロール設定')
+        frm_crawl.pack(fill='x', **pad)
+        ttk.Label(frm_crawl, text='対象URL:').grid(row=0, column=0, sticky='w', padx=6, pady=4)
+        self.var_url = tk.StringVar(value='https://')
+        ttk.Entry(frm_crawl, textvariable=self.var_url, width=55).grid(row=0, column=1, columnspan=3, sticky='ew', padx=4, pady=4)
+        ttk.Label(frm_crawl, text='最大ページ数:').grid(row=1, column=0, sticky='w', padx=6, pady=4)
+        self.var_max = tk.IntVar(value=5000)
+        ttk.Spinbox(frm_crawl, from_=1, to=100000, textvariable=self.var_max, width=10).grid(row=1, column=1, sticky='w', padx=4)
+        ttk.Label(frm_crawl, text='クロール間隔(秒):').grid(row=1, column=2, sticky='w', padx=6)
+        self.var_delay = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(frm_crawl, from_=0, to=5, increment=0.1, textvariable=self.var_delay, width=8, format='%.1f').grid(row=1, column=3, sticky='w', padx=4)
+        frm_crawl.columnconfigure(1, weight=1)
+
+        frm_excl = ttk.LabelFrame(self, text='🚫 除外URLパターン（正規表現・1行1パターン）')
+        frm_excl.pack(fill='x', **pad)
+        self.txt_exclude = scrolledtext.ScrolledText(frm_excl, height=4, font=('Consolas', 9))
+        self.txt_exclude.pack(fill='x', padx=6, pady=4)
+        self.txt_exclude.insert('end', '/wp-admin/\n/wp-login\n\\.(pdf|jpg|png|gif|zip)$\n')
+
+        frm_sm = ttk.LabelFrame(self, text='⚙️ サイトマップ設定')
+        frm_sm.pack(fill='x', **pad)
+        ttk.Label(frm_sm, text='changefreq:').grid(row=0, column=0, sticky='w', padx=6, pady=4)
+        self.var_changefreq = tk.StringVar(value='weekly')
+        ttk.Combobox(frm_sm, textvariable=self.var_changefreq, width=12,
+                     values=['always','hourly','daily','weekly','monthly','yearly','never'],
+                     state='readonly').grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Label(frm_sm, text='priority:').grid(row=0, column=2, sticky='w', padx=6)
+        self.var_priority = tk.DoubleVar(value=0.8)
+        ttk.Spinbox(frm_sm, from_=0.0, to=1.0, increment=0.1, textvariable=self.var_priority,
+                    width=8, format='%.1f').grid(row=0, column=3, sticky='w', padx=4)
+        ttk.Label(frm_sm, text='分割サイズ(件):').grid(row=0, column=4, sticky='w', padx=6)
+        self.var_chunk = tk.IntVar(value=50000)
+        ttk.Spinbox(frm_sm, from_=1000, to=50000, increment=1000, textvariable=self.var_chunk,
+                    width=10).grid(row=0, column=5, sticky='w', padx=4)
+
+        frm_out = ttk.LabelFrame(self, text='💾 出力先フォルダ')
+        frm_out.pack(fill='x', **pad)
+        self.var_outdir = tk.StringVar(value=os.path.expanduser('~/Desktop'))
+        ttk.Entry(frm_out, textvariable=self.var_outdir, width=55).grid(row=0, column=0, sticky='ew', padx=6, pady=4)
+        ttk.Button(frm_out, text='参照...', command=self._browse_dir).grid(row=0, column=1, padx=6)
+        frm_out.columnconfigure(0, weight=1)
+
+        frm_btn = ttk.Frame(self)
+        frm_btn.pack(fill='x', padx=10, pady=6)
+        self.btn_start = ttk.Button(frm_btn, text='▶ クロール開始', command=self._start_crawl, style='Accent.TButton')
+        self.btn_start.pack(side='left', padx=4)
+        self.btn_stop = ttk.Button(frm_btn, text='⏹ 中断', command=self._stop_crawl, state='disabled')
+        self.btn_stop.pack(side='left', padx=4)
+        self.btn_save = ttk.Button(frm_btn, text='💾 XML 保存', command=self._save_xml, state='disabled')
+        self.btn_save.pack(side='left', padx=4)
+        self.btn_clear = ttk.Button(frm_btn, text='🗑 クリア', command=self._clear)
+        self.btn_clear.pack(side='right', padx=4)
+        self.lbl_count = ttk.Label(frm_btn, text='収集URL: 0件', foreground='#444')
+        self.lbl_count.pack(side='right', padx=10)
+
+        self.progress = ttk.Progressbar(self, mode='indeterminate')
+        self.progress.pack(fill='x', padx=10, pady=2)
+
+        frm_log = ttk.LabelFrame(self, text='📋 ログ')
+        frm_log.pack(fill='both', expand=True, padx=10, pady=5)
+        self.txt_log = scrolledtext.ScrolledText(frm_log, font=('Consolas', 9),
+                                                  bg='#1e1e1e', fg='#d4d4d4',
+                                                  insertbackground='white')
+        self.txt_log.pack(fill='both', expand=True, padx=4, pady=4)
+
+    def _browse_dir(self):
+        d = filedialog.askdirectory(title='出力先フォルダを選択')
+        if d:
+            self.var_outdir.set(d)
+
+    def _start_crawl(self):
+        url = self.var_url.get().strip()
+        if not url.startswith('http'):
+            messagebox.showerror('エラー', 'URLは http:// または https:// から始めてください。')
+            return
+
+        self.url_data = {}
+        self.btn_start.config(state='disabled')
+        self.btn_stop.config(state='normal')
+        self.btn_save.config(state='disabled')
+        self.progress.start(10)
+        self._log('── クロール開始 ──────────────────────')
+
+        exclude_patterns = self.txt_exclude.get('1.0', 'end').splitlines()
+
+        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+        self.stop_flag = multiprocessing.Value('b', 0)
+
+        self.crawl_process = multiprocessing.Process(
+            target=crawler_process,
+            args=(url, self.var_max.get(), self.var_delay.get(),
+                  exclude_patterns, child_conn, self.stop_flag),
+            daemon=True
+        )
+        self.crawl_process.start()
+        child_conn.close()
+
+        def read_pipe():
+            while True:
+                try:
+                    msg_type, payload = parent_conn.recv()
+                    if msg_type == 'LOG':
+                        self.log_queue.put(payload)
+                    elif msg_type == 'DONE':
+                        self.url_data = payload
+                        self.after(0, self._crawl_done)
+                        break
+                    elif msg_type == 'ERROR':
+                        self.log_queue.put(f'❌ {payload}')
+                        self.after(0, self._crawl_done)
+                        break
+                except EOFError:
+                    self.after(0, self._crawl_done)
+                    break
+                except Exception as e:
+                    self.log_queue.put(f'パイプエラー: {e}')
+                    self.after(0, self._crawl_done)
+                    break
+            parent_conn.close()
+
+        threading.Thread(target=read_pipe, daemon=True).start()
+
+    def _stop_crawl(self):
+        if self.stop_flag:
+            self.stop_flag.value = 1
+
+    def _crawl_done(self):
+        self.progress.stop()
+        self.btn_start.config(state='normal')
+        self.btn_stop.config(state='disabled')
+        count = len(self.url_data)
+        self.lbl_count.config(text=f'収集URL: {count:,}件')
+        if count > 0:
+            self.btn_save.config(state='normal')
+            self._log(f'\n💡 {count:,} 件収集しました。「XML 保存」ボタンで出力できます。')
+
+    def _save_xml(self):
+        if not self.url_data:
+            messagebox.showwarning('警告', 'URLが収集されていません。')
+            return
+        out_dir = self.var_outdir.get().strip()
+        if not os.path.isdir(out_dir):
+            messagebox.showerror('エラー', '出力先フォルダが存在しません。')
+            return
+        base_url = self.var_url.get().strip()
+        try:
+            saved = save_sitemaps(
+                url_data=self.url_data,
+                out_dir=out_dir,
+                base_url_for_index=base_url,
+                priority=round(self.var_priority.get(), 1),
+                changefreq=self.var_changefreq.get(),
+                chunk_size=self.var_chunk.get(),
+            )
+            self._log('\n── 保存完了 ─────────────────────────')
+            for f in saved:
+                self._log(f'  📄 {f}')
+            messagebox.showinfo('完了', f'{len(saved)}ファイル保存しました。\n\n' + '\n'.join(saved))
+        except Exception as e:
+            messagebox.showerror('保存エラー', str(e))
+
+    def _clear(self):
+        self.url_data = {}
+        self.txt_log.delete('1.0', 'end')
+        self.lbl_count.config(text='収集URL: 0件')
+        self.btn_save.config(state='disabled')
+
+    def _poll_log(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self._log(msg)
+                if msg.startswith('['):
+                    try:
+                        n = int(msg.split(']')[0].strip('[').strip())
+                        self.lbl_count.config(text=f'収集URL: {n:,}件')
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_log)
+
+    def _log(self, msg):
+        self.txt_log.insert('end', msg + '\n')
+        self.txt_log.see('end')
+
+
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    multiprocessing.freeze_support()  # PyInstaller exe化に必要
+    app = App()
+    app.mainloop()
