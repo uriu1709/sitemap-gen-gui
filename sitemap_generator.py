@@ -20,7 +20,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import multiprocessing
 import threading
 from urllib.parse import urlparse, urlsplit, urlunsplit, quote
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -50,7 +50,8 @@ def normalize_url(url):
     if not p.scheme or not p.netloc:
         return url
     path = p.path or '/'
-    rebuilt = f'{p.scheme}://{p.netloc}{path}'
+    # scheme / netloc は RFC3986 上 大文字小文字を区別しないため小文字に統一
+    rebuilt = f'{p.scheme.lower()}://{p.netloc.lower()}{path}'
     if p.query:
         rebuilt += '?' + p.query
     return rebuilt
@@ -75,7 +76,10 @@ def parse_retry_after(value, default=30):
         return int(value)
     try:
         dt = parsedate_to_datetime(value)
-        delta = (dt - datetime.now(dt.tzinfo)).total_seconds()
+        # naive な場合は UTC とみなし、必ず aware 同士で計算（実行環境のTZに依存しない）
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
         return max(int(delta), 0)
     except Exception:
         return default
@@ -151,7 +155,7 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         pipe_conn.close()
         return
 
-    domain = urlparse(base_url).netloc
+    domain = urlparse(base_url).netloc.lower()
     url_data = {}
     to_visit = [normalize_url(base_url)]
     visited = set()
@@ -426,19 +430,21 @@ def _encode_loc(url):
     既存の %xx は safe='%' で二重エンコードしないようにする。
     国際化ドメイン(IDN)は Punycode(IDNA) へ変換する。"""
     parts = urlsplit(url)
-    netloc = parts.netloc
-    if netloc:
-        host, sep, port = netloc.rpartition(':')
-        if sep:
-            try:
-                netloc = host.encode('idna').decode('ascii') + ':' + port
-            except Exception:
-                pass
+    # hostname/port 属性を使い IPv6 アドレスやポート有無を安全に扱う
+    hostname = parts.hostname
+    if hostname:
+        try:
+            encoded_host = hostname.encode('idna').decode('ascii')
+        except Exception:
+            encoded_host = hostname
+        if ':' in encoded_host and not encoded_host.startswith('['):
+            netloc = f'[{encoded_host}]'   # IPv6 はブラケットで囲む
         else:
-            try:
-                netloc = netloc.encode('idna').decode('ascii')
-            except Exception:
-                pass
+            netloc = encoded_host
+        if parts.port is not None:
+            netloc = f'{netloc}:{parts.port}'
+    else:
+        netloc = parts.netloc
     path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
     query = quote(parts.query, safe="%:@!$&'()*+,;=~-._/?")
     return urlunsplit((parts.scheme, netloc, path, query, ''))
@@ -713,7 +719,8 @@ class App(tk.Tk):
         # ログ肥大化を防ぐため上限行数を超えたら古い行を削除
         line_count = int(self.txt_log.index('end-1c').split('.')[0])
         if line_count > self.MAX_LOG_LINES:
-            self.txt_log.delete('1.0', f'{line_count - self.MAX_LOG_LINES}.0')
+            # delete の終了インデックスは排他的なため +1 して古い行を確実に削除
+            self.txt_log.delete('1.0', f'{line_count - self.MAX_LOG_LINES + 1}.0')
         self.txt_log.see('end')
 
 
