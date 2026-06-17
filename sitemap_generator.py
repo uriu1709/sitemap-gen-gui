@@ -318,10 +318,14 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                             wait = min(2 ** attempt, 60)
                             pipe_conn.send(('LOG', f'  ⏳ {resp.status} サーバーエラー: {wait}秒後にリトライ ({attempt}/3) {url}'))
                             time.sleep(wait)
-                            resp = _goto(page, url)
-                            if resp and resp.status == 200:
-                                succeeded = True
-                                break
+                            # 一時的な接続エラーで残りのリトライを諦めないよう個別に捕捉
+                            try:
+                                resp = _goto(page, url)
+                                if resp and resp.status == 200:
+                                    succeeded = True
+                                    break
+                            except Exception:
+                                pass
                         if not succeeded:
                             pipe_conn.send(('LOG', f'  スキップ (リトライ失敗): {url}'))
                             record_result(False)
@@ -453,8 +457,12 @@ def _encode_loc(url):
             netloc = f'[{encoded_host}]'   # IPv6 はブラケットで囲む
         else:
             netloc = encoded_host
-        if parts.port is not None:
-            netloc = f'{netloc}:{parts.port}'
+        try:
+            port = parts.port   # 不正なポート文字列では ValueError
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f'{netloc}:{port}'
     else:
         netloc = parts.netloc
     path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
