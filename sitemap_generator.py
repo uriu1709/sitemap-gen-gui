@@ -19,7 +19,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import multiprocessing
 import threading
-from urllib.parse import urlparse, urlsplit, urlunsplit, quote
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote, urljoin
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import urllib.request
@@ -162,7 +162,8 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         pipe_conn.close()
         return
 
-    domain = urlparse(base_url).netloc.lower()
+    # normalize_url 経由で抽出し、リンク側の正規化（デフォルトポート除去等）と整合させる
+    domain = urlparse(normalize_url(base_url)).netloc.lower()
     url_data = {}
     to_visit = [normalize_url(base_url)]
     visited = set()
@@ -300,7 +301,8 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     # 429: バックオフして1回再試行
                     if resp.status == 429:
                         retry_after = parse_retry_after(resp.headers.get('retry-after'))
-                        wait = max(retry_after, 30)
+                        # 誤設定サーバーの極端な値でハングしないよう 30〜300秒に制限
+                        wait = min(max(retry_after, 30), 300)
                         pipe_conn.send(('LOG', f'  ⏳ 429 レート制限: {wait}秒待機後に再試行 {url}'))
                         time.sleep(wait)
                         resp = _goto(page, url)
@@ -360,7 +362,10 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     sitemap_url = url
                     try:
                         canonical = page.get_attribute('link[rel="canonical"]', 'href') or ''
-                        canonical = normalize_url(canonical.strip())
+                        canonical = canonical.strip()
+                        if canonical:
+                            # 相対 canonical を現在ページ基準で絶対URLへ解決
+                            canonical = normalize_url(urljoin(page.url, canonical))
                         if canonical and canonical != url:
                             p_can = urlparse(canonical)
                             if p_can.netloc == domain and p_can.scheme in ('http', 'https'):
