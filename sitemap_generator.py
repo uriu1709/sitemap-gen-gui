@@ -39,8 +39,9 @@ USER_AGENT = 'SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)'
 
 def normalize_url(url):
     """URL正規化: フラグメント(#)除去・クエリ保持。
-    ルートパス(/)のみ空に統一し、サブディレクトリの末尾スラッシュはサーバーの
-    正規形を尊重して保持する（非正規URLの登録・無駄なリダイレクトを避けるため）。"""
+    ルートパスは末尾スラッシュ(/)ありに統一し（Playwright の page.url と整合）、
+    サブディレクトリの末尾スラッシュはサーバーの正規形を尊重して保持する
+    （非正規URLの登録・無駄なリダイレクトを避けるため）。"""
     if not url:
         return url
     url = url.split('#')[0]
@@ -48,9 +49,7 @@ def normalize_url(url):
     p = urlsplit(url)
     if not p.scheme or not p.netloc:
         return url
-    path = p.path
-    if path == '/':
-        path = ''
+    path = p.path or '/'
     rebuilt = f'{p.scheme}://{p.netloc}{path}'
     if p.query:
         rebuilt += '?' + p.query
