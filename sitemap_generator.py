@@ -38,22 +38,28 @@ USER_AGENT = 'SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)'
 
 
 def normalize_url(url):
-    """URL正規化: フラグメント(#)除去・クエリは保持・パス末尾スラッシュを統一する。"""
+    """URL正規化: フラグメント(#)除去・クエリ保持。
+    ルートパス(/)のみ空に統一し、サブディレクトリの末尾スラッシュはサーバーの
+    正規形を尊重して保持する（非正規URLの登録・無駄なリダイレクトを避けるため）。"""
     if not url:
         return url
     url = url.split('#')[0]
     p = urlparse(url)
     if not p.scheme or not p.netloc:
-        return url.rstrip('/')
+        return url
     path = p.path
-    if path not in ('', '/'):
-        path = path.rstrip('/')
     if path == '/':
         path = ''
     rebuilt = f'{p.scheme}://{p.netloc}{path}'
     if p.query:
         rebuilt += '?' + p.query
     return rebuilt
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """リダイレクトを追従しないハンドラ（robots.txt 取得時のSSRF対策）。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def parse_retry_after(value, default=30):
@@ -183,11 +189,13 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         parsed_base = urlparse(base_url)
         robots_url = f'{parsed_base.scheme}://{parsed_base.netloc}/robots.txt'
         rp.set_url(robots_url)
-        # タイムアウト付きで取得（標準の rp.read() はタイムアウトが無くハングし得る）
+        # タイムアウト付きで取得（標準の rp.read() はタイムアウトが無くハングし得る）。
+        # リダイレクト追従は SSRF 回避のため無効化する。
         if not _is_safe_url(robots_url):
             raise ValueError('unsafe robots url')
+        opener = urllib.request.build_opener(_NoRedirectHandler)
         req = urllib.request.Request(robots_url, headers={'User-Agent': USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with opener.open(req, timeout=10) as r:
             text = r.read().decode('utf-8', errors='ignore')
         rp.parse(text.splitlines())
         robots_delay = rp.crawl_delay('*')
