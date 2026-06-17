@@ -1,1 +1,5 @@
+# 実行に必要なのは playwright のみ（別途 `playwright install chromium` が必要）
 playwright>=1.40.0
+
+# exe ビルド時のみ必要（build_exe.bat / build_helper.py が自動インストール）
+# pyinstaller>=6.0.0
