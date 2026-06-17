@@ -1,6 +1,7 @@
-# PyInstaller
+# PyInstaller（ビルドは build_helper.py が CLI 引数で生成するため .spec は管理しない）
 build/
 dist/
+*.spec
 *.spec.bak
 
 # Python

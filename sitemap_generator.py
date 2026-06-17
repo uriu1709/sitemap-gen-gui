@@ -19,8 +19,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import multiprocessing
 import threading
-from urllib.parse import urlparse
-from datetime import datetime
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote, urljoin
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import urllib.request
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import re
@@ -30,6 +32,78 @@ import queue
 import time
 import socket
 import ipaddress
+
+
+USER_AGENT = 'SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)'
+
+
+def normalize_url(url):
+    """URL正規化: フラグメント(#)除去・クエリ保持。
+    ルートパスは末尾スラッシュ(/)ありに統一し（Playwright の page.url と整合）、
+    サブディレクトリの末尾スラッシュはサーバーの正規形を尊重して保持する
+    （非正規URLの登録・無駄なリダイレクトを避けるため）。"""
+    if not url:
+        return url
+    url = url.split('#')[0]
+    # urlsplit を使い ;params（例: /path;sid=123）を path 内に保持する
+    p = urlsplit(url)
+    if not p.scheme or not p.netloc:
+        return url
+    path = p.path or '/'
+    # scheme / netloc は RFC3986 上 大文字小文字を区別しないため小文字に統一
+    scheme = p.scheme.lower()
+    netloc = p.netloc.lower()
+    # デフォルトポートは除去（Playwright の page.url と整合させ誤リダイレクト判定を防ぐ）。
+    # IPv6 アドレスや不正ポートを誤って壊さないよう port プロパティで判定する。
+    try:
+        port = p.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == 'http' and port == 80)
+                             or (scheme == 'https' and port == 443)):
+        netloc = netloc.rsplit(':', 1)[0]
+    rebuilt = f'{scheme}://{netloc}{path}'
+    if p.query:
+        rebuilt += '?' + p.query
+    return rebuilt
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """SSRF対策付きリダイレクトハンドラ。
+    リダイレクト先が安全（_is_safe_url）な場合のみ追従し、http→https 等の
+    正当なリダイレクトは許可しつつプライベートIP等への誘導を遮断する。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_safe_url(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def parse_retry_after(value, default=30):
+    """Retry-After ヘッダーを秒数として返す（秒数・HTTP-date 両対応）。"""
+    if not value:
+        return default
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        dt = parsedate_to_datetime(value)
+        # naive な場合は UTC とみなし、必ず aware 同士で計算（実行環境のTZに依存しない）
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(int(delta), 0)
+    except Exception:
+        return default
+
+
+def _goto(page, url, timeout=30000, settle_timeout=5000):
+    """domcontentloaded で遷移後、JS描画完了を待つ（networkidle が来なくても続行）。"""
+    resp = page.goto(url, timeout=timeout, wait_until='domcontentloaded')
+    try:
+        page.wait_for_load_state('networkidle', timeout=settle_timeout)
+    except Exception:
+        pass
+    return resp
 
 
 def _get_browsers_path():
@@ -92,10 +166,12 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         pipe_conn.close()
         return
 
-    domain = urlparse(base_url).netloc
+    # normalize_url 経由で抽出し、リンク側の正規化（デフォルトポート除去等）と整合させる
+    domain = urlparse(normalize_url(base_url)).netloc.lower()
     url_data = {}
-    to_visit = [base_url.rstrip('/')]
+    to_visit = [normalize_url(base_url)]
     visited = set()
+    fetched = 0   # 実際に取得を試みたページ数（= 最大ページ数の基準）
 
     # エラー率監視用
     recent_results = []   # True=成功, False=失敗
@@ -133,19 +209,31 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         parsed_base = urlparse(base_url)
         robots_url = f'{parsed_base.scheme}://{parsed_base.netloc}/robots.txt'
         rp.set_url(robots_url)
-        rp.read()
+        # タイムアウト付きで取得（標準の rp.read() はタイムアウトが無くハングし得る）。
+        # リダイレクトは安全なURLのみ追従（SSRF対策）。
+        if not _is_safe_url(robots_url):
+            raise ValueError('unsafe robots url')
+        opener = urllib.request.build_opener(_SafeRedirectHandler)
+        req = urllib.request.Request(robots_url, headers={'User-Agent': USER_AGENT})
+        with opener.open(req, timeout=10) as r:
+            # リダイレクト拒否時は 3xx がそのまま返るため、200 以外は robots 無しとして扱う
+            if r.getcode() != 200:
+                raise ValueError(f'invalid status: {r.getcode()}')
+            text = r.read().decode('utf-8', errors='ignore')
+        rp.parse(text.splitlines())
         robots_delay = rp.crawl_delay('*')
         if robots_delay:
             crawl_delay = max(delay, float(robots_delay))
             pipe_conn.send(('LOG', f'  robots.txt Crawl-delay: {robots_delay}s → {crawl_delay}s で動作'))
     except Exception:
         rp = None
+        pipe_conn.send(('LOG', '  robots.txt 取得をスキップ（未設置/タイムアウト等）'))
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent='SitemapGenBot/1.0 (+https://github.com/uriu1709/sitemap-gen-gui)',
+                user_agent=USER_AGENT,
                 service_workers='block',
             )
             page = context.new_page()
@@ -153,9 +241,9 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
             # ダイアログ（alert/confirm/prompt）を自動で閉じる
             page.on('dialog', lambda dialog: dialog.dismiss())
 
-            # HTMLとscriptのみ許可（余計なAPIリクエストをブロック）
-            BLOCK_TYPES = {'image', 'media', 'font', 'stylesheet', 'fetch', 'xhr',
-                           'websocket', 'eventsource', 'other'}
+            # 帯域節約のため画像・メディア・フォント・CSSのみブロック。
+            # fetch/xhr/websocket 等は JS描画に必要なため許可する。
+            BLOCK_TYPES = {'image', 'media', 'font', 'stylesheet'}
 
             def handle_route(route):
                 try:
@@ -172,7 +260,7 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
 
             page.route('**/*', handle_route)
 
-            while to_visit and len(url_data) < max_pages:
+            while to_visit and fetched < max_pages:
                 if stop_flag.value:
                     pipe_conn.send(('LOG', '⏹ クロールを中断しました。'))
                     break
@@ -199,9 +287,10 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     visited.add(url)
                     continue
                 visited.add(url)
+                fetched += 1
 
                 try:
-                    resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                    resp = _goto(page, url)
 
                     if not resp:
                         pipe_conn.send(('LOG', f'  スキップ (no resp): {url}'))
@@ -215,11 +304,12 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
 
                     # 429: バックオフして1回再試行
                     if resp.status == 429:
-                        retry_after = int(resp.headers.get('retry-after', '30'))
-                        wait = max(retry_after, 30)
+                        retry_after = parse_retry_after(resp.headers.get('retry-after'))
+                        # 誤設定サーバーの極端な値でハングしないよう 30〜300秒に制限
+                        wait = min(max(retry_after, 30), 300)
                         pipe_conn.send(('LOG', f'  ⏳ 429 レート制限: {wait}秒待機後に再試行 {url}'))
                         time.sleep(wait)
-                        resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                        resp = _goto(page, url)
                         if not resp or resp.status != 200:
                             pipe_conn.send(('LOG', f'  スキップ (再試行失敗 {resp.status if resp else "no resp"}): {url}'))
                             record_result(False)
@@ -232,10 +322,14 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                             wait = min(2 ** attempt, 60)
                             pipe_conn.send(('LOG', f'  ⏳ {resp.status} サーバーエラー: {wait}秒後にリトライ ({attempt}/3) {url}'))
                             time.sleep(wait)
-                            resp = page.goto(url, timeout=30000, wait_until='domcontentloaded')
-                            if resp and resp.status == 200:
-                                succeeded = True
-                                break
+                            # 一時的な接続エラーで残りのリトライを諦めないよう個別に捕捉
+                            try:
+                                resp = _goto(page, url)
+                                if resp and resp.status == 200:
+                                    succeeded = True
+                                    break
+                            except Exception:
+                                pass
                         if not succeeded:
                             pipe_conn.send(('LOG', f'  スキップ (リトライ失敗): {url}'))
                             record_result(False)
@@ -246,9 +340,9 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                         record_result(False)
                         continue
 
-                    # リダイレクト検出
-                    final_url = page.url.rstrip('/')
-                    if final_url != url.rstrip('/'):
+                    # リダイレクト検出（同一の正規化ルールで比較）
+                    final_url = normalize_url(page.url)
+                    if final_url != url:
                         pipe_conn.send(('LOG', f'  リダイレクト除外: {url} → {page.url}'))
                         record_result(True)
                         if crawl_delay > 0:
@@ -276,7 +370,10 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                     sitemap_url = url
                     try:
                         canonical = page.get_attribute('link[rel="canonical"]', 'href') or ''
-                        canonical = canonical.strip().split('#')[0].split('?')[0].rstrip('/')
+                        canonical = canonical.strip()
+                        if canonical:
+                            # 相対 canonical を現在ページ基準で絶対URLへ解決
+                            canonical = normalize_url(urljoin(page.url, canonical))
                         if canonical and canonical != url:
                             p_can = urlparse(canonical)
                             if p_can.netloc == domain and p_can.scheme in ('http', 'https'):
@@ -312,7 +409,7 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
                                 'a[href]', 'els => els.map(e => e.href)'
                             )
                             for abs_url in anchors:
-                                abs_url = abs_url.split('#')[0].split('?')[0].rstrip('/')
+                                abs_url = normalize_url(abs_url)
                                 if not abs_url:
                                     continue
                                 p = urlparse(abs_url)
@@ -348,12 +445,41 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
 # ─────────────────────────────────────────────
 # サイトマップ書き出し
 # ─────────────────────────────────────────────
+def _encode_loc(url):
+    """サイトマップ仕様(IRI)に従い loc を percent-encode する。
+    既存の %xx は safe='%' で二重エンコードしないようにする。
+    国際化ドメイン(IDN)は Punycode(IDNA) へ変換する。"""
+    parts = urlsplit(url)
+    # hostname/port 属性を使い IPv6 アドレスやポート有無を安全に扱う
+    hostname = parts.hostname
+    if hostname:
+        try:
+            encoded_host = hostname.encode('idna').decode('ascii')
+        except Exception:
+            encoded_host = hostname
+        if ':' in encoded_host and not encoded_host.startswith('['):
+            netloc = f'[{encoded_host}]'   # IPv6 はブラケットで囲む
+        else:
+            netloc = encoded_host
+        try:
+            port = parts.port   # 不正なポート文字列では ValueError
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f'{netloc}:{port}'
+    else:
+        netloc = parts.netloc
+    path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
+    query = quote(parts.query, safe="%:@!$&'()*+,;=~-._/?")
+    return urlunsplit((parts.scheme, netloc, path, query, ''))
+
+
 def build_sitemap_xml(urls_data, priority, changefreq):
     root = ET.Element('urlset')
     root.set('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9')
     for url, lastmod in urls_data:
         url_el = ET.SubElement(root, 'url')
-        ET.SubElement(url_el, 'loc').text = url
+        ET.SubElement(url_el, 'loc').text = _encode_loc(url)
         if lastmod:
             ET.SubElement(url_el, 'lastmod').text = lastmod
         ET.SubElement(url_el, 'changefreq').text = changefreq
@@ -499,8 +625,9 @@ class App(tk.Tk):
 
     def _start_crawl(self):
         url = self.var_url.get().strip()
-        if not url.startswith('http'):
-            messagebox.showerror('エラー', 'URLは http:// または https:// から始めてください。')
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
+            messagebox.showerror('エラー', '有効なURLを入力してください（http:// または https:// + ドメイン）。')
             return
 
         self.url_data = {}
@@ -609,8 +736,15 @@ class App(tk.Tk):
             pass
         self.after(150, self._poll_log)
 
+    MAX_LOG_LINES = 5000
+
     def _log(self, msg):
         self.txt_log.insert('end', msg + '\n')
+        # ログ肥大化を防ぐため上限行数を超えたら古い行を削除
+        line_count = int(self.txt_log.index('end-1c').split('.')[0])
+        if line_count > self.MAX_LOG_LINES:
+            # delete の終了インデックスは排他的なため +1 して古い行を確実に削除
+            self.txt_log.delete('1.0', f'{line_count - self.MAX_LOG_LINES + 1}.0')
         self.txt_log.see('end')
 
 
