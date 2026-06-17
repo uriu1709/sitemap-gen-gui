@@ -44,7 +44,8 @@ def normalize_url(url):
     if not url:
         return url
     url = url.split('#')[0]
-    p = urlparse(url)
+    # urlsplit を使い ;params（例: /path;sid=123）を path 内に保持する
+    p = urlsplit(url)
     if not p.scheme or not p.netloc:
         return url
     path = p.path
@@ -56,10 +57,14 @@ def normalize_url(url):
     return rebuilt
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """リダイレクトを追従しないハンドラ（robots.txt 取得時のSSRF対策）。"""
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """SSRF対策付きリダイレクトハンドラ。
+    リダイレクト先が安全（_is_safe_url）な場合のみ追従し、http→https 等の
+    正当なリダイレクトは許可しつつプライベートIP等への誘導を遮断する。"""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        if not _is_safe_url(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def parse_retry_after(value, default=30):
@@ -190,12 +195,15 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
         robots_url = f'{parsed_base.scheme}://{parsed_base.netloc}/robots.txt'
         rp.set_url(robots_url)
         # タイムアウト付きで取得（標準の rp.read() はタイムアウトが無くハングし得る）。
-        # リダイレクト追従は SSRF 回避のため無効化する。
+        # リダイレクトは安全なURLのみ追従（SSRF対策）。
         if not _is_safe_url(robots_url):
             raise ValueError('unsafe robots url')
-        opener = urllib.request.build_opener(_NoRedirectHandler)
+        opener = urllib.request.build_opener(_SafeRedirectHandler)
         req = urllib.request.Request(robots_url, headers={'User-Agent': USER_AGENT})
         with opener.open(req, timeout=10) as r:
+            # リダイレクト拒否時は 3xx がそのまま返るため、200 以外は robots 無しとして扱う
+            if r.getcode() != 200:
+                raise ValueError(f'invalid status: {r.getcode()}')
             text = r.read().decode('utf-8', errors='ignore')
         rp.parse(text.splitlines())
         robots_delay = rp.crawl_delay('*')
@@ -416,11 +424,25 @@ def crawler_process(base_url, max_pages, delay, exclude_patterns, pipe_conn, sto
 # ─────────────────────────────────────────────
 def _encode_loc(url):
     """サイトマップ仕様(IRI)に従い loc を percent-encode する。
-    既存の %xx は safe='%' で二重エンコードしないようにする。"""
+    既存の %xx は safe='%' で二重エンコードしないようにする。
+    国際化ドメイン(IDN)は Punycode(IDNA) へ変換する。"""
     parts = urlsplit(url)
+    netloc = parts.netloc
+    if netloc:
+        host, sep, port = netloc.rpartition(':')
+        if sep:
+            try:
+                netloc = host.encode('idna').decode('ascii') + ':' + port
+            except Exception:
+                pass
+        else:
+            try:
+                netloc = netloc.encode('idna').decode('ascii')
+            except Exception:
+                pass
     path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
     query = quote(parts.query, safe="%:@!$&'()*+,;=~-._/?")
-    return urlunsplit((parts.scheme, parts.netloc, path, query, ''))
+    return urlunsplit((parts.scheme, netloc, path, query, ''))
 
 
 def build_sitemap_xml(urls_data, priority, changefreq):
