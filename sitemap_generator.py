@@ -51,7 +51,14 @@ def normalize_url(url):
         return url
     path = p.path or '/'
     # scheme / netloc は RFC3986 上 大文字小文字を区別しないため小文字に統一
-    rebuilt = f'{p.scheme.lower()}://{p.netloc.lower()}{path}'
+    scheme = p.scheme.lower()
+    netloc = p.netloc.lower()
+    # デフォルトポートは除去（Playwright の page.url と整合させ誤リダイレクト判定を防ぐ）
+    if scheme == 'http' and netloc.endswith(':80'):
+        netloc = netloc[:-3]
+    elif scheme == 'https' and netloc.endswith(':443'):
+        netloc = netloc[:-4]
+    rebuilt = f'{scheme}://{netloc}{path}'
     if p.query:
         rebuilt += '?' + p.query
     return rebuilt
@@ -602,7 +609,7 @@ class App(tk.Tk):
     def _start_crawl(self):
         url = self.var_url.get().strip()
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        if parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
             messagebox.showerror('エラー', '有効なURLを入力してください（http:// または https:// + ドメイン）。')
             return
 
