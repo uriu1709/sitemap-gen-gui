@@ -53,11 +53,15 @@ def normalize_url(url):
     # scheme / netloc は RFC3986 上 大文字小文字を区別しないため小文字に統一
     scheme = p.scheme.lower()
     netloc = p.netloc.lower()
-    # デフォルトポートは除去（Playwright の page.url と整合させ誤リダイレクト判定を防ぐ）
-    if scheme == 'http' and netloc.endswith(':80'):
-        netloc = netloc[:-3]
-    elif scheme == 'https' and netloc.endswith(':443'):
-        netloc = netloc[:-4]
+    # デフォルトポートは除去（Playwright の page.url と整合させ誤リダイレクト判定を防ぐ）。
+    # IPv6 アドレスや不正ポートを誤って壊さないよう port プロパティで判定する。
+    try:
+        port = p.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == 'http' and port == 80)
+                             or (scheme == 'https' and port == 443)):
+        netloc = netloc.rsplit(':', 1)[0]
     rebuilt = f'{scheme}://{netloc}{path}'
     if p.query:
         rebuilt += '?' + p.query
